@@ -1,8 +1,8 @@
 """
 NSE-Option-Chain-Analyzer - Android (Kivy) port of Varun Shanbhag's desktop app v5.8 (GPLv3).
-Same screens, menu options, colours, messages and refresh logic; UI rebuilt for touch.
+The UI only displays data; fetching/analysis/paper trading/notifications run in engine.py, inside an
+Android foreground service, so everything keeps running when the app is closed or in the background.
 """
-import datetime
 import os
 import sys
 import threading
@@ -14,8 +14,8 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
 from kivy.core.window import Window
-from kivy.metrics import dp
 from kivy.graphics import Color, Rectangle
+from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.gridlayout import GridLayout
@@ -33,6 +33,7 @@ import nse_core as core
 
 IS_ANDROID = platform == 'android'
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+SERVICE_CLASS = 'org.nseoca.nseoptionchain.ServiceNseservice'
 
 BG = hexc("#0d0d0d")
 PANEL = hexc("#1e1e1e")
@@ -47,17 +48,6 @@ N_COLS = 9
 def android_activity():
     from jnius import autoclass
     return autoclass('org.kivy.android.PythonActivity').mActivity
-
-
-def get_export_dir(default: str) -> str:
-    if IS_ANDROID:
-        try:
-            d = android_activity().getExternalFilesDir(None)
-            if d is not None:
-                return d.getAbsolutePath()
-        except Exception as err:
-            print(err)
-    return default
 
 
 def copy_to_downloads(path: str):
@@ -95,19 +85,19 @@ def copy_to_downloads(path: str):
         return None
 
 
-def keep_screen_on(flag: bool) -> None:
-    if not IS_ANDROID:
-        return
+def open_battery_settings():
     try:
-        from android.runnable import run_on_ui_thread
         from jnius import autoclass
+        Intent = autoclass('android.content.Intent')
+        Settings = autoclass('android.provider.Settings')
+        android_activity().startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+    except Exception as err:
+        print(err)
 
-        @run_on_ui_thread
-        def _apply():
-            lp = autoclass('android.view.WindowManager$LayoutParams')
-            window = android_activity().getWindow()
-            (window.addFlags if flag else window.clearFlags)(lp.FLAG_KEEP_SCREEN_ON)
-        _apply()
+
+def minimize_app():
+    try:
+        android_activity().moveTaskToBack(True)
     except Exception as err:
         print(err)
 
@@ -184,8 +174,7 @@ class PickerButton(Button):
         def fill(*a):
             listing.clear_widgets()
             q = search.text.strip().lower()
-            shown = [v for v in self.values if q in v.lower()][:300]
-            for v in shown:
+            for v in [v for v in self.values if q in v.lower()][:300]:
                 b = Button(text=v, size_hint_y=None, height=dp(44))
                 b.bind(on_release=lambda btn, v=v: choose(v))
                 listing.add_widget(b)
@@ -242,19 +231,14 @@ class NseApp(App):
         Window.bind(on_keyboard=self.on_keyboard)
         self.client = core.NseClient()
         self.cfg = None
-        self.debuglog = None
-        self.exporter = None
-        self.halted = False
-        self.first_run = True
-        self._event = None
-        self._busy = False
+        self.run_id = None
+        self._poll = None
         self._token = 0
-        self._error_open = False
         self.sm = ScreenManager(transition=NoTransition())
         loading = Screen(name='loading')
         box = BoxLayout(orientation='vertical', padding=dp(30), spacing=dp(12))
         box.add_widget(Image(source=os.path.join(APP_DIR, 'nse_logo.png'), size_hint_y=.5))
-        box.add_widget(Label(text="NSE-Option-Chain-Analyzer\nLoading symbols...", halign='center'))
+        box.add_widget(Label(text="NSE-Option-Chain-Analyzer\nLoading...", halign='center'))
         loading.add_widget(box)
         self.sm.add_widget(loading)
         return self.sm
@@ -273,11 +257,21 @@ class NseApp(App):
                                      'android.permission.WRITE_EXTERNAL_STORAGE'])
             except Exception as err:
                 print(err)
-        self.data_dir = self.user_data_dir
-        self.export_dir = get_export_dir(self.data_dir)
+        self.base = core.shared_dir()
+        self.export_dir = core.external_dir()
         os.makedirs(self.export_dir, exist_ok=True)
         self.exporter = core.CsvExporter(self.export_dir)
-        self.load_symbols()
+        session = core.read_json(self.pth('session.json'), {})
+        symbols = core.read_json(self.pth('symbols.json'), None)
+        if session.get('active') and symbols:  # app re-opened while a background session exists
+            self.indices, self.stocks = symbols['indices'], symbols['stocks']
+            self.cfg = core.Config(self.pth('NSE-OCA.ini'), self.indices, self.stocks, True)
+            self.resume(session)
+        else:
+            self.load_symbols()
+
+    def pth(self, name):
+        return os.path.join(self.base, name)
 
     def on_pause(self):
         return True
@@ -287,20 +281,31 @@ class NseApp(App):
             if self.sm.current == 'main':
                 self.close_main()
             else:
-                self.stop_app()
+                self.quit_app()
             return True
         return False
 
-    def stop_app(self):
+    def quit_app(self):
+        """Close the UI. If a background session is active it keeps running."""
         try:
             self.client.close()
         except Exception:
             pass
-        if self.cfg and self.cfg.logging:
-            print('----------Quitting Program----------')
-        keep_screen_on(False)
-        self.stop_event()
         App.get_running_app().stop()
+
+    def stop_everything(self):
+        """Stop the background service and close the app."""
+        core.write_json(self.pth('control.json'), {'paused': True, 'quit': True})
+        session = core.read_json(self.pth('session.json'), {})
+        session['active'] = False
+        core.write_json(self.pth('session.json'), session)
+        if IS_ANDROID:
+            try:
+                from jnius import autoclass
+                autoclass(SERVICE_CLASS).stop(android_activity())
+            except Exception as err:
+                print(err)
+        self.quit_app()
 
     # ---- small utilities -------------------------------------------------
     @property
@@ -324,30 +329,6 @@ class NseApp(App):
     def error(self, title, message, cb=None):
         dialog(title, message, [("OK", cb)])
 
-    def toast(self, title, message):
-        p = Popup(title=title, content=Label(text=message), size_hint=(.8, .22))
-        p.open()
-        Clock.schedule_once(lambda dt: p.dismiss(), 4)
-
-    def notify(self, title, message):
-        try:
-            from plyer import notification
-            notification.notify(title=title, message=message, app_name="NSE-Option-Chain-Analyzer", timeout=4)
-        except Exception as err:
-            print(err)
-            self.toast(title, message)
-
-    def set_status(self, text):
-        try:
-            self.status.text = text
-        except Exception:
-            pass
-
-    def stop_event(self):
-        if self._event is not None:
-            self._event.cancel()
-            self._event = None
-
     # ---- symbols / login screen -----------------------------------------
     def load_symbols(self):
         def work():
@@ -360,15 +341,13 @@ class NseApp(App):
         threading.Thread(target=work, daemon=True).start()
 
     def symbols_failed(self):
-        dialog("Error", "Failed to fetch Symbols.\nThe program will now exit.",
-               [("Retry", self.load_symbols), ("Exit", self.stop_app)])
+        dialog("Error", "Failed to fetch Symbols.\nCheck your internet connection.",
+               [("Retry", self.load_symbols), ("Exit", self.quit_app)])
 
     def symbols_ready(self, indices, stocks):
         self.indices, self.stocks = indices, stocks
-        self.cfg = core.Config(os.path.join(self.data_dir, 'NSE-OCA.ini'), indices, stocks, True)
-        if self.cfg.logging:
-            self.debuglog = core.DebugLog(os.path.join(self.export_dir, 'NSE-OCA.log'))
-            self.debuglog.start()
+        core.write_json(self.pth('symbols.json'), {'indices': indices, 'stocks': stocks})
+        self.cfg = core.Config(self.pth('NSE-OCA.ini'), indices, stocks, True)
         self.build_login()
         self.sm.current = 'login'
         self.fetch_dates()
@@ -423,10 +402,7 @@ class NseApp(App):
         return self.index_picker.value if self.cfg.option_mode == 'Index' else self.stock_picker.value
 
     def change_option_mode(self):
-        if self.cfg.option_mode == 'Index':
-            self.cfg.set('option_mode', 'Stock')
-        else:
-            self.cfg.set('option_mode', 'Index')
+        self.cfg.set('option_mode', 'Stock' if self.cfg.option_mode == 'Index' else 'Index')
         mode = self.cfg.option_mode
         self.mode_btn.text = mode
         self.index_picker.disabled = mode != 'Index'
@@ -462,33 +438,45 @@ class NseApp(App):
     def start(self):
         seconds = int(self.intervals_picker.value) * 60
         self.cfg.set('seconds', seconds)
-        self.expiry_date = self.date_picker.value
-        if self.expiry_date == "":
+        expiry = self.date_picker.value
+        if expiry == "":
             self.error("Error", "Incorrect Expiry Date.\nPlease enter correct Expiry Date.")
             return
         try:
-            self.sp = int(self.sp_entry.text)
+            sp = int(self.sp_entry.text)
         except ValueError as err:
             print(err, sys.exc_info()[0], "7")
             self.error("Error", "Incorrect Strike Price.\nPlease enter correct Strike Price.")
             return
         self.cfg.set('index' if self.cfg.option_mode == 'Index' else 'stock', self.current_login_symbol())
-        if self.cfg.live_export:
-            self.export_header_only()
-        self.main_win()
+        session = {'active': True, 'run_id': str(int(time.time())), 'mode': self.cfg.option_mode,
+                   'symbol': self.symbol, 'expiry': expiry, 'sp': sp, 'seconds': seconds}
+        core.write_json(self.pth('session.json'), session)
+        core.write_json(self.pth('control.json'), {'paused': False, 'quit': False})
+        try:
+            os.remove(self.pth('state.json'))
+        except OSError:
+            pass
+        self.main_win(session, fresh=True)
+
+    def resume(self, session):
+        self.main_win(session, fresh=False)
 
     # ---- main screen ------------------------------------------------------
-    def main_win(self):
-        mode = self.cfg.option_mode
-        self.units = core.units_for(mode)
-        self.output_columns, self.csv_headers = core.column_headers(mode)
-        self.first_run = True
-        self.halted = False
-        self.previous_date = self.previous_time = None
-        self.prev = {}
-        self.old_values = [None] * N_COLS
+    def main_win(self, session, fresh):
+        self.session = session
+        self.run_id = session['run_id']
+        self.expiry_date, self.sp = session['expiry'], session['sp']
+        self.units = core.units_for(session['mode'])
+        self.output_columns, self.csv_headers = core.column_headers(session['mode'])
+        self._seen_version = 0
+        self._rows_shown = 0
+        self._popup_seen = 0
+        self._last_price = None
         self.table_rows = []
-        self.expiry_date_used = self.expiry_date
+        self.trade = {}
+        ctl = core.read_json(self.pth('control.json'), {})
+        self.halted = bool(ctl.get('paused'))
 
         if self.sm.has_screen('main'):
             self.sm.remove_widget(self.sm.get_screen('main'))
@@ -496,17 +484,21 @@ class NseApp(App):
         root = BoxLayout(orientation='vertical', spacing=dp(4), padding=dp(4))
 
         bar = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
-        self.title_label = Label(text=f"{self.symbol} - {self.expiry_date} - {self.sp}", bold=True,
+        self.title_label = Label(text=f"{session['symbol']} - {self.expiry_date} - {self.sp}", bold=True,
                                  halign='left', valign='middle', shorten=True)
         self.title_label.bind(size=lambda *a: setattr(self.title_label, 'text_size', self.title_label.size))
         bar.add_widget(self.title_label)
         bar.add_widget(Button(text="Menu", size_hint_x=None, width=dp(90),
                               on_release=lambda *a: self.open_menu()))
         root.add_widget(bar)
-        self.status = Label(text="Starting...", size_hint_y=None, height=dp(22), font_size=dp(11),
+        self.status = Label(text="Starting...", size_hint_y=None, height=dp(20), font_size=dp(11),
                             color=(0.7, 0.7, 0.7, 1), halign='left')
         self.status.bind(size=lambda *a: setattr(self.status, 'text_size', self.status.size))
         root.add_widget(self.status)
+        self.trade_label = Label(text="Paper: no trade yet", size_hint_y=None, height=dp(22),
+                                 font_size=dp(12), bold=True, color=hexc(core.GREEN), halign='left')
+        self.trade_label.bind(size=lambda *a: setattr(self.trade_label, 'text_size', self.trade_label.size))
+        root.add_widget(self.trade_label)
 
         hscroll = ScrollView(do_scroll_x=True, do_scroll_y=False, bar_width=dp(4))
         table = BoxLayout(orientation='vertical', size_hint=(None, 1), width=CELL_W * N_COLS, spacing=dp(1))
@@ -523,7 +515,7 @@ class NseApp(App):
         hscroll.add_widget(table)
         root.add_widget(hscroll)
 
-        panel = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(34) * 11, spacing=dp(1))
+        panel = BoxLayout(orientation='vertical', size_hint_y=None, spacing=dp(1))
 
         def row(*cells):
             r = BoxLayout(spacing=dp(1))
@@ -531,8 +523,8 @@ class NseApp(App):
                 r.add_widget(c)
             panel.add_widget(r)
 
-        def lab(text, bold=True):
-            return Cell(text, bold=bold, font_size=dp(12))
+        def lab(text):
+            return Cell(text, bold=True, font_size=dp(12))
 
         self.v = {}
 
@@ -555,8 +547,92 @@ class NseApp(App):
         screen.add_widget(root)
         self.sm.add_widget(screen)
         self.sm.current = 'main'
-        keep_screen_on(True)
-        Clock.schedule_once(self.tick, 0.1)
+
+        if not self.halted:
+            self.start_engine()
+        if self._poll is not None:
+            self._poll.cancel()
+        self._poll = Clock.schedule_interval(self.poll_state, 1.5)
+        if fresh:
+            if self.cfg.update:
+                self.check_for_updates()
+            self.battery_hint()
+
+    def battery_hint(self):
+        flag = self.pth('battery_hint_done')
+        if not IS_ANDROID or os.path.isfile(flag):
+            return
+        open(flag, 'w').write('1')
+        dialog("Keep running in background",
+               "So that Android does not stop the app, set Battery for this app to \"Unrestricted\" / "
+               "\"Don't optimize\" and allow Notifications.\n\nOpen the battery settings now?",
+               [("Open settings", open_battery_settings), ("Later", None)], height=.5)
+
+    # ---- background engine ---------------------------------------------------
+    def start_engine(self):
+        if IS_ANDROID:
+            try:
+                from jnius import autoclass
+                svc = autoclass(SERVICE_CLASS)
+                act = android_activity()
+                try:
+                    svc.start(act, '', 'NSE Option Chain Analyzer', 'Fetching option chain in background', '')
+                except Exception:
+                    svc.start(act, '')
+            except Exception:
+                self.error("Service error", traceback.format_exc())
+        else:  # desktop testing: run the engine in a thread
+            import engine
+
+            def work():
+                class _N:
+                    def notify(self, t, m):
+                        print("[NOTIFY]", t, m)
+                engine.Engine(self.base, self.export_dir, _N()).run()
+            threading.Thread(target=work, daemon=True).start()
+
+    def poll_state(self, dt):
+        st = core.read_json(self.pth('state.json'), None)
+        if not st or st.get('run_id') != self.run_id or st.get('version') == self._seen_version:
+            return
+        self._seen_version = st['version']
+        self.status.text = st.get('status', '')
+        self._last_price = st.get('last_price')
+        for key, cell in self.v.items():
+            if key in st.get('values', {}):
+                cell.text = st['values'][key]
+                cell.set_bg(st.get('label_bg', {}).get(key) if key in st.get('label_bg', {}) else None)
+        rows, colors = st.get('rows', []), st.get('colors', [])
+        at_bottom = self.rows_scroll.scroll_y <= 0.1
+        for i in range(self._rows_shown, len(rows)):
+            r = BoxLayout(size_hint_y=None, height=dp(32), spacing=dp(1))
+            for text, bg in zip(rows[i], colors[i]):
+                r.add_widget(Cell(str(text), bg=bg or None, font_size=dp(13)))
+            self.rows_box.add_widget(r)
+        if len(rows) > self._rows_shown and at_bottom:
+            Clock.schedule_once(lambda dt: setattr(self.rows_scroll, 'scroll_y', 0), 0.1)
+        self._rows_shown = len(rows)
+        self.table_rows = rows
+        self.trade = st.get('trade', {})
+        self.trade_label.text = core.trade_summary(self.trade, self._last_price)[0]
+        for p in st.get('popups', []):
+            if p['id'] > self._popup_seen:
+                self._popup_seen = p['id']
+                cb = self.back_to_login if p.get('action') == 'login' else None
+                self.error(p['title'], p['msg'], cb)
+        if st.get('finished'):
+            self.halted = True
+
+    def back_to_login(self):
+        if self._poll is not None:
+            self._poll.cancel()
+        session = core.read_json(self.pth('session.json'), {})
+        session['active'] = False
+        core.write_json(self.pth('session.json'), session)
+        if not self.sm.has_screen('login'):
+            self.build_login()
+        self.sm.current = 'login'
+        self.fetch_dates()
 
     # ---- menu --------------------------------------------------------------
     def open_menu(self):
@@ -564,6 +640,7 @@ class NseApp(App):
         onoff = lambda b: 'On' if b else 'Off'
         items = [
             ("Start" if self.halted else "Stop", self.change_state),
+            ("Paper Trades", self.show_trades),
             ("Export Table to CSV", self.export),
             (f"Live Exporting to CSV: {onoff(c.live_export)}", self.toggle_live_export),
             (f"Dump Entire Option Chain to CSV: {onoff(c.save_oc)}", self.toggle_save_oc),
@@ -572,10 +649,10 @@ class NseApp(App):
             (f"Warn Late Server Updates: {onoff(c.warn_late_update)}", self.toggle_warn_late_update),
             ("Copy Table to Clipboard", self.copy_table),
             ("Save CSV Files to Downloads", self.save_all_to_downloads),
+            ("Battery: allow background", open_battery_settings),
             (f"Auto Check for Updates: {onoff(c.update)}", self.toggle_updates),
-            (f"Debug Logging: {onoff(c.logging)}", self.log),
             ("About", self.about),
-            ("Quit", self.close_main),
+            ("Quit (stops background too)", self.close_main),
         ]
         view = ModalView(size_hint=(.9, .85))
         outer = BoxLayout(orientation='vertical', padding=dp(8), spacing=dp(4))
@@ -592,35 +669,45 @@ class NseApp(App):
         view.open()
 
     def change_state(self):
+        ctl = core.read_json(self.pth('control.json'), {})
         if not self.halted:
             self.halted = True
-            self.stop_event()
+            core.write_json(self.pth('control.json'), {**ctl, 'paused': True})
             self.info("Stopped", "Retrieving new data has been stopped.")
         else:
             self.halted = False
+            core.write_json(self.pth('control.json'), {**ctl, 'paused': False, 'quit': False})
+            session = core.read_json(self.pth('session.json'), {})
+            session['active'] = True
+            core.write_json(self.pth('session.json'), session)
+            self.start_engine()
             self.info("Started", "Retrieving new data has been started.")
-            self.tick()
+
+    def show_trades(self):
+        short, text = core.trade_summary(self.trade or {}, self._last_price)
+        text += (f"\n\nEvery trade is also saved to NSE-OCA-PaperTrades-{self.session['symbol']}-"
+                 f"{self.expiry_date}.csv")
+        dialog("Paper Trades", text, [("OK", None)], height=.7, auto_dismiss=True)
 
     def toggle(self, key, on_title, on_msg, off_title, off_msg):
         new = not getattr(self.cfg, key)
         self.cfg.set(key, new)
         self.info(on_title if new else off_title, on_msg if new else off_msg)
-        return new
 
     def toggle_live_export(self):
         self.toggle('live_export', "Live Exporting Enabled",
-                    f"Data rows will be exported in real time to NSE-OCA-{self.symbol}-{self.expiry_date}.csv.",
+                    f"Data rows will be exported in real time to NSE-OCA-{self.session['symbol']}-{self.expiry_date}.csv.",
                     "Live Exporting Disabled", "Data rows will not be exported.")
-        self.export_header_only()
 
     def toggle_save_oc(self):
         self.toggle('save_oc', "Dump Entire Option Chain Enabled",
-                    f"Entire Option Chain data will be exported to NSE-OCA-{self.symbol}-{self.expiry_date}-Full.csv.",
+                    f"Entire Option Chain data will be exported to NSE-OCA-{self.session['symbol']}-{self.expiry_date}-Full.csv.",
                     "Dump Entire Option Chain Disabled", "Entire Option Chain data will not be exported.")
 
     def toggle_notifications(self):
         self.toggle('notifications', "Notifications Enabled",
-                    "You will receive Notifications when the state of a label changes.",
+                    "You will get a popup notification with sound when the state of a label changes "
+                    "and when a paper trade is taken.",
                     "Notifications Disabled", "You will not receive any Notifications.")
 
     def toggle_auto_stop(self):
@@ -635,20 +722,6 @@ class NseApp(App):
     def toggle_updates(self):
         self.toggle('update', "Auto Checking for Updates Enabled", "Program will check for updates at start.",
                     "Auto Checking for Updates Disabled", "Program will not check for updates at start.")
-
-    def log(self):
-        if not self.cfg.logging:
-            path = os.path.join(self.export_dir, 'NSE-OCA.log')
-            self.debuglog = core.DebugLog(path)
-            self.debuglog.start()
-            print(f"{'Android' if IS_ANDROID else sys.platform} .py version {core.VERSION}")
-            self.cfg.set('logging', True)
-            self.info("Debug Logging Enabled", f"Errors will be logged to NSE-OCA.log.\n{path}")
-        else:
-            if self.debuglog:
-                self.debuglog.stop()
-            self.cfg.set('logging', False)
-            self.info("Debug Logging Disabled", "Errors will not be logged.")
 
     def copy_table(self):
         lines = ["\t".join(self.csv_headers)] + ["\t".join(str(x) for x in r) for r in self.table_rows]
@@ -696,8 +769,7 @@ class NseApp(App):
                 return
             if newer:
                 msg = (f"You are running version: {core.VERSION}\nLatest version: {tag}\n"
-                       f"Do you want to update now ?\n"
-                       f"{'You can disable auto check for updates from the menu.' if auto and self.cfg.update else ''}")
+                       f"Do you want to update now ?")
                 self.ui(lambda: dialog("New Update Available", msg, [
                     ("Yes", lambda: webbrowser.open(f"https://github.com/{self.repo}/releases/latest")),
                     ("No", None)]))
@@ -707,205 +779,23 @@ class NseApp(App):
         threading.Thread(target=work, daemon=True).start()
 
     # ---- export --------------------------------------------------------------
-    def perm_msg(self, name):
-        return f"Failed to access {name}.\nPermission Denied. Try closing any apps using it."
-
-    def export_header_only(self):
-        try:
-            self.exporter.ensure_header(self.symbol, self.expiry_date, self.csv_headers_safe())
-        except PermissionError as err:
-            print(err, sys.exc_info()[0], "13")
-            self.error("Export Failed", self.perm_msg(os.path.basename(self.exporter.path(self.symbol, self.expiry_date))))
-        except Exception as err:
-            print(err, sys.exc_info()[0], "9")
-
-    def csv_headers_safe(self):
-        if hasattr(self, 'csv_headers'):
-            return self.csv_headers
-        return core.column_headers(self.cfg.option_mode)[1]
-
     def export(self):
-        name = f"NSE-OCA-{self.symbol}-{self.expiry_date}.csv"
+        sym = self.session['symbol']
+        name = f"NSE-OCA-{sym}-{self.expiry_date}.csv"
         try:
-            path = self.exporter.export_table(self.symbol, self.expiry_date, self.csv_headers, self.table_rows)
+            path = self.exporter.export_table(sym, self.expiry_date, self.csv_headers, self.table_rows)
             where = copy_to_downloads(path)
             msg = f"Data has been exported to {name}."
             msg += f"\nA copy was saved in {where}." if where else f"\nLocation: {self.export_dir}"
             self.info("Export Successful", msg)
         except PermissionError as err:
             print(err, sys.exc_info()[0], "12")
-            self.error("Export Failed", self.perm_msg(name))
+            self.error("Export Failed", f"Failed to access {name}.\nPermission Denied. Try closing any apps using it.")
         except Exception as err:
             print(err, sys.exc_info()[0], "8")
             self.error("Export Failed", "An error occurred while exporting the data.")
 
     def close_main(self):
-        dialog("Quit", "All unsaved data will be lost.\nProceed to quit?",
-               [("Yes", self.stop_app), ("No", None)])
-
-    # ---- refresh loop (port of Nse.main) ----------------------------------------
-    def schedule_next(self):
-        self.stop_event()
-        if not self.halted:
-            self._event = Clock.schedule_once(self.tick, self.cfg.seconds)
-
-    def tick(self, dt=None):
-        self.stop_event()
-        if self.halted or self._busy:
-            return
-        self._busy = True
-        self.set_status('Fetching data...')
-        mode, symbol, expiry, first = self.cfg.option_mode, self.symbol, self.expiry_date, self.first_run
-
-        def work():
-            try:
-                if first:
-                    data = self.client.fetch_chain_first(mode, symbol, expiry)
-                else:
-                    data = self.client.fetch_chain_refresh(mode, symbol, expiry)
-                self.ui(self.on_chain, data, None)
-            except Exception as err:
-                print(err, sys.exc_info()[0], "1")
-                self.ui(self.on_chain, None, err)
-        threading.Thread(target=work, daemon=True).start()
-
-    def on_chain(self, json_data, err):
-        self._busy = False
-        if self.halted:
-            return
-        if err is not None:
-            self.set_status(f"Fetch failed: {err}")
-            if not self._error_open:
-                self._error_open = True
-                self.error("Error", "Error in fetching dates.\nPlease retry.",
-                           cb=lambda: setattr(self, '_error_open', False))
-            return self.schedule_next()
-        if json_data is None:
-            self.set_status('No data received from NSE, retrying...')
-            return self.schedule_next()
-        try:
-            self.process(json_data)
-        except Exception as e:
-            print(e, sys.exc_info()[0], "process")
-            self.set_status(f"Error: {e}")
-            if not self._error_open:
-                self._error_open = True
-                dialog("Error", traceback.format_exc(), [("OK", lambda: setattr(self, '_error_open', False))],
-                       height=.8)
-            self.schedule_next()
-
-    def process(self, json_data):
-        try:
-            rows, timestamp, points = core.parse_chain(json_data, self.expiry_date)
-        except core.InvalidExpiry:
-            self.error("Error", "Invalid Expiry Date.\nPlease restart and enter a new Expiry Date.")
-            self.halted = True
-            self.info("Stopped", "Retrieving new data has been stopped.")
-            return
-        self.points = points
-        str_time = timestamp.split(" ")[1]
-        current_date = datetime.datetime.strptime(timestamp.split(" ")[0], '%d-%b-%Y').date()
-        current_time = datetime.datetime.strptime(str_time, '%H:%M:%S').time()
-        if self.first_run:
-            self.previous_date, self.previous_time = current_date, current_time
-        elif current_date > self.previous_date:
-            self.previous_date, self.previous_time = current_date, current_time
-        elif current_date == self.previous_date:
-            if current_time > self.previous_time:
-                diff = core.minutes_since(self.previous_time, current_time)
-                if diff >= core.TIME_DIFFERENCE_FACTOR and self.cfg.warn_late_update:
-                    msg = f"The data from the server was last updated about {int(diff)} minutes ago."
-                    Clock.schedule_once(lambda dt: self.info("Late Update", msg), 2)
-                self.previous_time = current_time
-            else:
-                self.set_status(f"No new data from server (last update {str_time})")
-                return self.schedule_next()
-
-        try:
-            a = core.analyze(rows, self.sp, self.cfg.option_mode)
-        except core.IncorrectStrike:
-            self.halted = True
-            self.error("Error", "Incorrect Strike Price.\nPlease enter correct Strike Price.",
-                       cb=self.back_to_login)
-            return
-        if self.halted:
-            return
-        self.set_values(a, str_time)
-        self.set_status(f"Updated: server time {str_time}")
-
-        if self.cfg.save_oc:
-            try:
-                self.exporter.dump_full(self.symbol, self.expiry_date, rows)
-            except PermissionError as err:
-                print(err, sys.exc_info()[0], "11")
-                self.error("Export Failed", self.perm_msg(f"NSE-OCA-{self.symbol}-{self.expiry_date}-Full.csv"))
-            except Exception as err:
-                print(err, sys.exc_info()[0], "16")
-
-        if self.first_run:
-            if self.cfg.update:
-                self.check_for_updates()
-            self.first_run = False
-        today = datetime.datetime.strptime(time.strftime("%d-%b-%Y", time.localtime()), "%d-%b-%Y").date()
-        if str_time == '15:30:00' and not self.halted and self.cfg.auto_stop and self.previous_date == today:
-            self.halted = True
-            self.info("Market Closed", "Retrieving new data has been stopped.")
-            return
-        self.schedule_next()
-
-    def back_to_login(self):
-        keep_screen_on(False)
-        self.stop_event()
-        self.sm.current = 'login'
-
-    def changed(self, key, new, title, symbol_text=None):
-        """Notification on change, mirroring the desktop `if first_run or old == new` blocks."""
-        old = self.prev.get(key)
-        if not self.first_run and old is not None and old != new and self.cfg.notifications:
-            self.notify(f"{title} changed for {self.symbol}", f"Changed from {old} to {new}")
-        self.prev[key] = new
-
-    def set_values(self, a, str_time):
-        v = self.v
-        v['ub_oi1'].text, v['ub_sp1'].text = str(a.max_call_oi), str(a.max_call_oi_sp)
-        v['ub_oi2'].text, v['ub_sp2'].text = str(a.max_call_oi_2), str(a.max_call_oi_sp_2)
-        v['lb_oi1'].text, v['lb_sp1'].text = str(a.max_put_oi), str(a.max_put_oi_sp)
-        v['lb_oi2'].text, v['lb_sp2'].text = str(a.max_put_oi_2), str(a.max_put_oi_sp_2)
-        self.changed('ub1', a.max_call_oi_sp, "Upper Boundary Strike Price")
-        self.changed('ub2', a.max_call_oi_sp_2, "Upper Boundary Strike Price 2")
-        self.changed('lb1', a.max_put_oi_sp, "Lower Boundary Strike Price")
-        self.changed('lb2', a.max_put_oi_sp_2, "Lower Boundary Strike Price 2")
-
-        labels = core.compute_labels(a)
-        titles = {'oi': "Open Interest", 'call_itm': "Call ITM", 'put_itm': "Put ITM",
-                  'call_exits': "Call Exits", 'put_exits': "Put Exits"}
-        for key, (text, bg) in labels.items():
-            v[key].text = str(text)
-            v[key].set_bg(bg)
-            if key in titles:
-                self.changed(key, text, titles[key])
-
-        values = [str_time, self.points, a.call_sum, a.put_sum, a.difference, a.call_boundary,
-                  a.put_boundary, a.call_itm, a.put_itm]
-        colors = [''] * N_COLS
-        for col in range(1, N_COLS):
-            colors[col] = core.trend_color(col, values[col], self.old_values[col]) or ''
-            self.old_values[col] = values[col]
-        self.table_rows.append(values)
-        if self.cfg.live_export:
-            try:
-                self.exporter.export_row(self.symbol, self.expiry_date, values)
-            except PermissionError as err:
-                print(err, sys.exc_info()[0], "14")
-                self.error("Export Failed", self.perm_msg(f"NSE-OCA-{self.symbol}-{self.expiry_date}.csv"))
-            except Exception as err:
-                print(err, sys.exc_info()[0], "15")
-
-        at_bottom = self.rows_scroll.scroll_y <= 0.1
-        row = BoxLayout(size_hint_y=None, height=dp(32), spacing=dp(1))
-        for text, bg in zip(values, colors):
-            row.add_widget(Cell(str(text), bg=bg or None, font_size=dp(13)))
-        self.rows_box.add_widget(row)
-        if at_bottom:
-            Clock.schedule_once(lambda dt: setattr(self.rows_scroll, 'scroll_y', 0), 0.1)
-
+        dialog("Close", "The app can keep fetching data and sending notifications in the background.",
+               [("Minimize", minimize_app if IS_ANDROID else self.quit_app),
+                ("Stop & Quit", self.stop_everything), ("Cancel", None)], height=.45)

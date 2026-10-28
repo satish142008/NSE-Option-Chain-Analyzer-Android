@@ -8,6 +8,7 @@ desktop version; pandas/tkinter were removed so it runs on Android.
 import configparser
 import csv
 import datetime
+import json
 import os
 import sys
 import time
@@ -426,6 +427,10 @@ class NseClient:
             return None
         return json_data or None
 
+    def refresh_cookies(self) -> None:
+        """Visit the NSE option-chain page to obtain fresh cookies (needed in the background service)."""
+        self._reset_session()
+
     def _reset_session(self) -> None:
         self.session.close()
         self.session = requests.Session()
@@ -514,3 +519,139 @@ class DebugLog:
         print('----------Logging Stopped----------')
         sys.stdout, sys.stderr = self.stdout, self.stderr
         self.active = False
+
+
+# --------------------------------------------------------------------------- shared files (UI <-> service)
+def _android_context():
+    from jnius import autoclass
+    ctx = None
+    try:
+        ctx = autoclass('org.kivy.android.PythonService').mService  # inside the background service
+    except Exception:
+        ctx = None
+    if ctx is None:
+        ctx = autoclass('org.kivy.android.PythonActivity').mActivity  # inside the UI process
+    if ctx is None:
+        raise RuntimeError("no android context")
+    return ctx
+
+
+def shared_dir() -> str:
+    """Private folder used by both the UI process and the background service."""
+    try:
+        d = os.path.join(_android_context().getFilesDir().getAbsolutePath(), 'nseoca')
+    except Exception:
+        d = os.path.join(os.path.expanduser('~'), '.nse_oca')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def external_dir() -> str:
+    """Folder for CSV / log files (app-specific external storage on Android)."""
+    try:
+        d = _android_context().getExternalFilesDir(None)
+        if d is not None:
+            return d.getAbsolutePath()
+    except Exception:
+        pass
+    return shared_dir()
+
+
+def read_json(path: str, default: Any = None) -> Any:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def write_json(path: str, obj: Any) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def read_flags(path: str) -> Dict[str, bool]:
+    """Settings the background service re-reads on every refresh (toggled from the UI menu)."""
+    parser = configparser.ConfigParser()
+    parser.read(path)
+    out = {}
+    for key in ('live_export', 'save_oc', 'notifications', 'auto_stop', 'warn_late_update'):
+        try:
+            out[key] = parser.getboolean('main', key)
+        except Exception:
+            out[key] = False
+    return out
+
+
+# --------------------------------------------------------------------------- paper trading
+class PaperTrader:
+    """Stop-and-reverse paper trading on the Open Interest signal.
+
+    Bearish -> Bullish : close SHORT (if any) and go LONG at the current price.
+    Bullish -> Bearish : close LONG (if any) and go SHORT at the current price.
+    P&L is in index/stock points per 1 unit.
+    """
+
+    def __init__(self) -> None:
+        self.position: Optional[Dict[str, Any]] = None
+        self.trades: List[Dict[str, Any]] = []
+        self.total = 0.0
+
+    def on_signal(self, label: str, price: float, time_str: str) -> Optional[Dict[str, Any]]:
+        want = 'LONG' if label == 'Bullish' else 'SHORT'
+        if self.position and self.position['side'] == want:
+            return None
+        closed = None
+        if self.position:
+            entry = self.position['entry']
+            pnl = (price - entry) if self.position['side'] == 'LONG' else (entry - price)
+            closed = {'side': self.position['side'], 'entry': entry, 'exit': price,
+                      'open_time': self.position['time'], 'close_time': time_str, 'pnl': round(pnl, 2)}
+            self.trades.append(closed)
+            self.total = round(self.total + closed['pnl'], 2)
+        self.position = {'side': want, 'entry': price, 'time': time_str}
+        return {'action': 'BUY' if want == 'LONG' else 'SELL', 'side': want, 'price': price,
+                'time': time_str, 'closed': closed, 'total': self.total}
+
+    def unrealized(self, price: float) -> float:
+        if not self.position:
+            return 0.0
+        e = self.position['entry']
+        return round((price - e) if self.position['side'] == 'LONG' else (e - price), 2)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {'position': self.position, 'trades': self.trades, 'total': self.total}
+
+    def load(self, d: Dict[str, Any]) -> None:
+        self.position = d.get('position')
+        self.trades = list(d.get('trades', []))
+        self.total = d.get('total', 0.0)
+
+
+def signed(x: float) -> str:
+    return f"{x:+.2f}".rstrip('0').rstrip('.') if x else "0"
+
+
+def trade_summary(trade: Dict[str, Any], last_price: Optional[float]) -> Tuple[str, str]:
+    """(one-line summary, full text) for the UI."""
+    pos = trade.get('position')
+    total = trade.get('total', 0.0)
+    trades = trade.get('trades', [])
+    if pos:
+        unreal = 0.0
+        if last_price is not None:
+            unreal = (last_price - pos['entry']) if pos['side'] == 'LONG' else (pos['entry'] - last_price)
+        unreal = round(unreal, 2)
+        short = f"Paper: {pos['side']} @ {pos['entry']} | open {signed(unreal)} | total {signed(total)} pts"
+        head = (f"Open position: {pos['side']} @ {pos['entry']} (since {pos['time']})\n"
+                f"Current price: {last_price}   Unrealized: {signed(unreal)} pts\n")
+    else:
+        short = f"Paper: no trade yet (waits for a Bullish/Bearish change) | total {signed(total)} pts"
+        head = "No open position. A trade opens when the Open Interest signal changes.\n"
+    lines = [head + f"Realized P&L: {signed(total)} pts   Closed trades: {len(trades)}\n"]
+    for t in reversed(trades[-15:]):
+        lines.append(f"{t['open_time']} -> {t['close_time']}  {t['side']}  {t['entry']} -> {t['exit']}  "
+                     f"{signed(t['pnl'])}")
+    return short, "\n".join(lines)
